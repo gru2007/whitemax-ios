@@ -4,6 +4,7 @@ Python обертка для Swift для работы с pymax.
 """
 
 import asyncio
+import datetime
 import json
 import os
 import ssl
@@ -61,6 +62,42 @@ except ImportError as e:
 
 class MaxClientWrapper:
     """Синхронная обертка для SocketMaxClient (для iOS)."""
+
+    @staticmethod
+    def _get_field(obj: Any, *names: str, default: Any = None) -> Any:
+        """Безопасно получить поле у dict / объекта / Pydantic модели (на случай смены типов в pymax)."""
+        if obj is None:
+            return default
+        if isinstance(obj, dict):
+            for name in names:
+                if name in obj:
+                    return obj.get(name)
+            return default
+        for name in names:
+            if hasattr(obj, name):
+                return getattr(obj, name)
+        return default
+
+    @staticmethod
+    def _normalize_time_to_int_ms(value: Any) -> Optional[int]:
+        """Привести время сообщения к Int (ms), чтобы JSON всегда был сериализуем и совместим со Swift."""
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, (int, float)):
+            return int(value)
+        if isinstance(value, datetime.datetime):
+            # Для совместимости со Swift моделью используем миллисекунды
+            return int(value.timestamp() * 1000)
+        if isinstance(value, str):
+            s = value.strip()
+            if s.isdigit():
+                try:
+                    return int(s)
+                except Exception:
+                    return None
+        return None
     
     def __init__(self, phone: str, work_dir: Optional[str] = None, token: Optional[str] = None):
         """
@@ -333,16 +370,21 @@ class MaxClientWrapper:
                 # Получаем информацию о текущем пользователе
                 me_info = None
                 if self.client.me:
-                    # Безопасно получаем first_name из names
-                    first_name = None
-                    if self.client.me.names and len(self.client.me.names) > 0:
-                        # Используем first_name, если есть, иначе name
-                        first_name = self.client.me.names[0].first_name or self.client.me.names[0].name
-                    
+                    # Безопасно получаем first_name из names (поддержка и dict/pydantic)
+                    first_name = ""
+                    names = self._get_field(self.client.me, "names", default=None)
+                    if names and isinstance(names, list) and len(names) > 0:
+                        n0 = names[0]
+                        first_name = (
+                            self._get_field(n0, "first_name", "firstName", default=None)
+                            or self._get_field(n0, "name", default=None)
+                            or ""
+                        )
+
                     me_info = {
-                        "id": self.client.me.id,
-                        "first_name": first_name or "",  # Всегда строка, даже если пустая
-                        "phone": self.client.me.phone or self.phone,
+                        "id": self._get_field(self.client.me, "id", default=0),
+                        "first_name": first_name,  # Всегда строка, даже если пустая
+                        "phone": self._get_field(self.client.me, "phone", default=None) or self.phone,
                     }
                 return {
                     "success": True,
@@ -402,10 +444,15 @@ class MaxClientWrapper:
                             # Получаем пользователя по ID из _users
                             if dialog.cid in self.client._users:
                                 user = self.client._users[dialog.cid]
-                                if user.names and len(user.names) > 0:
-                                    # Используем name, если есть, иначе first_name
-                                    title = user.names[0].name or user.names[0].first_name or f"User {dialog.cid}"
-                                photo_id = user.photo_id  # User имеет photo_id
+                                user_names = self._get_field(user, "names", default=None)
+                                if user_names and isinstance(user_names, list) and len(user_names) > 0:
+                                    n0 = user_names[0]
+                                    title = (
+                                        self._get_field(n0, "name", default=None)
+                                        or self._get_field(n0, "first_name", "firstName", default=None)
+                                        or f"User {dialog.cid}"
+                                    )
+                                photo_id = self._get_field(user, "photo_id", "photoId", default=None)
                         except Exception:
                             pass
                     
@@ -427,10 +474,10 @@ class MaxClientWrapper:
                     for chat in chats:
                         chat_dict = {
                             "id": chat.id,
-                            "title": chat.title or "",
+                            "title": self._get_field(chat, "title", default="") or "",
                             "type": "CHAT",
                             "photo_id": None,  # Chat не имеет photo_id, использует base_icon_url
-                            "icon_url": chat.base_icon_url,
+                            "icon_url": self._get_field(chat, "base_icon_url", "baseIconUrl", default=None),
                             "unread_count": 0,  # Chat не имеет unread_count
                         }
                         all_chats.append(chat_dict)
@@ -439,10 +486,10 @@ class MaxClientWrapper:
                 for channel in self.client.channels:
                     chat_dict = {
                         "id": channel.id,
-                        "title": channel.title or "",
+                        "title": self._get_field(channel, "title", default="") or "",
                         "type": "CHANNEL",
                         "photo_id": None,  # Channel не имеет photo_id, использует base_icon_url
-                        "icon_url": channel.base_icon_url,
+                        "icon_url": self._get_field(channel, "base_icon_url", "baseIconUrl", default=None),
                         "unread_count": 0,  # Channel не имеет unread_count
                     }
                     all_chats.append(chat_dict)
@@ -602,6 +649,7 @@ class MaxClientWrapper:
                         
                         msg_text = getattr(msg, 'text', '') or ""
                         msg_time = getattr(msg, 'time', None)
+                        msg_time_ms = self._normalize_time_to_int_ms(msg_time)
                         msg_sender = getattr(msg, 'sender', None) or getattr(msg, 'sender_id', None)
                         
                         # Получаем chat_id из сообщения, если есть, иначе используем переданный
@@ -618,8 +666,8 @@ class MaxClientWrapper:
                             "chat_id": msg_chat_id,  # Всегда число, не None
                             "text": msg_text,
                             "sender_id": msg_sender,
-                            "date": msg_time,  # Используем time для сортировки и отображения
-                            "time": msg_time,  # Добавляем time для сортировки
+                            "date": msg_time_ms,  # Swift ожидает Int?
+                            "time": msg_time_ms,  # Внутренняя сортировка/отладка
                             "type": msg.type.value if hasattr(msg.type, 'value') else str(msg.type) if hasattr(msg, 'type') else None,
                         }
                         messages_list.append(msg_dict)
@@ -672,16 +720,21 @@ class MaxClientWrapper:
                     # Получаем информацию о пользователе
                     me_info = None
                     if self.client.me:
-                        # Безопасно получаем first_name из names
-                        first_name = None
-                        if self.client.me.names and len(self.client.me.names) > 0:
-                            # Используем first_name, если есть, иначе name
-                            first_name = self.client.me.names[0].first_name or self.client.me.names[0].name
-                        
+                        # Безопасно получаем first_name из names (поддержка и dict/pydantic)
+                        first_name = ""
+                        names = self._get_field(self.client.me, "names", default=None)
+                        if names and isinstance(names, list) and len(names) > 0:
+                            n0 = names[0]
+                            first_name = (
+                                self._get_field(n0, "first_name", "firstName", default=None)
+                                or self._get_field(n0, "name", default=None)
+                                or ""
+                            )
+
                         me_info = {
-                            "id": self.client.me.id,
-                            "first_name": first_name or "",  # Всегда строка, даже если пустая
-                            "phone": self.client.me.phone or self.phone,
+                            "id": self._get_field(self.client.me, "id", default=0),
+                            "first_name": first_name,  # Всегда строка, даже если пустая
+                            "phone": self._get_field(self.client.me, "phone", default=None) or self.phone,
                         }
                     
                     return {
