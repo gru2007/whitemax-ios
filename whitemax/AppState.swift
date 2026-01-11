@@ -37,15 +37,12 @@ class AppState: ObservableObject {
         Task {
             // Проверяем наличие токена
             let hasToken = service.checkAuthentication()
-            let privateMode = UserDefaults.standard.bool(forKey: "private_mode")
             
             if hasToken {
                 // Пытаемся запустить клиент и восстановить сессию
                 do {
                     try await service.startClient()
-                    if !privateMode {
-                        try? await service.startEventMonitoring()
-                    }
+                    try? await service.startEventMonitoring()
                     isAuthenticated = service.isAuthenticated
                 } catch {
                     print("Failed to start client: \(error)")

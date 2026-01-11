@@ -8,6 +8,7 @@
 import SwiftUI
 import PhotosUI
 import UniformTypeIdentifiers
+import Photos
 
 struct MessagesView: View {
     let chat: MaxChat
@@ -26,10 +27,16 @@ struct MessagesView: View {
 
     @State private var showAttachmentSheet: Bool = false
     @State private var showFileImporter: Bool = false
+    @State private var showPhotoPicker: Bool = false
     @State private var pickedPhotoItem: PhotosPickerItem?
 
     @State private var pendingAttachment: PendingAttachment?
     @State private var sendErrorMessage: String?
+    @State private var previewAttachment: MaxAttachment?
+    @State private var shareFileURL: URL?
+    @State private var showShareSheet = false
+    @State private var showSaveSuccessAlert = false
+    @State private var saveError: String?
 
     struct PendingAttachment: Identifiable {
         enum Kind { case photo, file }
@@ -87,15 +94,18 @@ struct MessagesView: View {
         .navigationTitle(chat.title)
         .navigationBarTitleDisplayMode(.inline)
         .confirmationDialog("Вложение", isPresented: $showAttachmentSheet, titleVisibility: .visible) {
-            PhotosPicker(selection: $pickedPhotoItem, matching: .images) {
-                Label("Фото из галереи", systemImage: "photo.on.rectangle")
+            Button("Фото из галереи") {
+                showPhotoPicker = true
             }
-            Button {
+            Button("Файл") {
                 showFileImporter = true
-            } label: {
-                Label("Файл", systemImage: "doc")
             }
         }
+        .photosPicker(
+            isPresented: $showPhotoPicker,
+            selection: $pickedPhotoItem,
+            matching: .images
+        )
         .fileImporter(
             isPresented: $showFileImporter,
             allowedContentTypes: [.data],
@@ -112,9 +122,7 @@ struct MessagesView: View {
         .task {
             await loadMessagesAsync()
             // Enable real-time events (best-effort)
-            if !UserDefaults.standard.bool(forKey: "private_mode") {
-                try? await service.startEventMonitoring()
-            }
+            try? await service.startEventMonitoring()
         }
         .onChange(of: service.newMessages.count) { _ in
             guard let last = service.newMessages.last else { return }
@@ -138,6 +146,26 @@ struct MessagesView: View {
         .onChange(of: pickedPhotoItem) { _, newItem in
             guard let newItem else { return }
             Task { await stagePickedPhoto(item: newItem) }
+        }
+        .sheet(item: $previewAttachment) { a in
+            AttachmentPreviewSheet(attachment: a)
+        }
+        .sheet(isPresented: $showShareSheet) {
+            if let fileURL = shareFileURL {
+                ShareSheet(items: [fileURL])
+            }
+        }
+        .alert("Сохранено", isPresented: $showSaveSuccessAlert) {
+            Button("OK") { }
+        } message: {
+            Text("Вложение успешно сохранено")
+        }
+        .alert("Ошибка", isPresented: .constant(saveError != nil)) {
+            Button("OK") { saveError = nil }
+        } message: {
+            if let error = saveError {
+                Text(error)
+            }
         }
     }
 
@@ -179,7 +207,16 @@ struct MessagesView: View {
                                         onEdit: { startEdit(message) },
                                         onReact: { reactionTarget = message },
                                     onDelete: { deleteMessage(message) },
-                                    onPin: { pinMessage(message) }
+                                    onPin: { pinMessage(message) },
+                                    onOpenAttachment: { a in
+                                        previewAttachment = a
+                                    },
+                                    onSaveAttachment: { attachment in
+                                        Task { await saveAttachmentDirectly(attachment) }
+                                    },
+                                    onShareAttachment: { attachment in
+                                        Task { await shareAttachmentDirectly(attachment) }
+                                    }
                                 )
                                 .id(message.id)
                             }
@@ -444,6 +481,296 @@ struct MessagesView: View {
                 // ignore for now (UI polish later)
             }
         }
+    }
+    
+    private func saveAttachmentDirectly(_ attachment: MaxAttachment) async {
+        guard let urlString = attachment.url,
+              let url = URL(string: urlString) else {
+            await MainActor.run {
+                saveError = "URL вложения недоступен"
+            }
+            return
+        }
+        
+        do {
+            let (data, _) = try await URLSession.shared.data(from: url)
+            
+            if attachment.type.uppercased() == "PHOTO" {
+                // Сохраняем фото в Photos library
+                let status = await PHPhotoLibrary.requestAuthorization(for: .addOnly)
+                guard status == .authorized || status == .limited else {
+                    await MainActor.run {
+                        saveError = "Необходим доступ к библиотеке фото"
+                    }
+                    return
+                }
+                
+                guard let image = UIImage(data: data) else {
+                    await MainActor.run {
+                        saveError = "Не удалось создать изображение"
+                    }
+                    return
+                }
+                
+                try await PHPhotoLibrary.shared().performChanges {
+                    PHAssetChangeRequest.creationRequestForAsset(from: image)
+                }
+                
+                await MainActor.run {
+                    showSaveSuccessAlert = true
+                }
+            } else {
+                // Сохраняем файл в Documents
+                let documentsPath = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+                let fileName = attachment.fileName ?? "attachment_\(attachment.id)"
+                let fileURL = documentsPath.appendingPathComponent(fileName)
+                
+                try data.write(to: fileURL)
+                
+                await MainActor.run {
+                    showSaveSuccessAlert = true
+                }
+            }
+        } catch {
+            await MainActor.run {
+                saveError = "Не удалось сохранить: \(error.localizedDescription)"
+            }
+        }
+    }
+    
+    private func shareAttachmentDirectly(_ attachment: MaxAttachment) async {
+        guard let urlString = attachment.url,
+              let url = URL(string: urlString) else {
+            await MainActor.run {
+                saveError = "URL вложения недоступен"
+            }
+            return
+        }
+        
+        do {
+            let (data, _) = try await URLSession.shared.data(from: url)
+            
+            // Сохраняем во временный файл для sharing
+            let tempDir = FileManager.default.temporaryDirectory
+            let fileName = attachment.fileName ?? "attachment_\(attachment.id)"
+            let tempFileURL = tempDir.appendingPathComponent(fileName)
+            
+            try data.write(to: tempFileURL)
+            
+            await MainActor.run {
+                shareFileURL = tempFileURL
+                showShareSheet = true
+            }
+        } catch {
+            await MainActor.run {
+                saveError = "Не удалось загрузить: \(error.localizedDescription)"
+            }
+        }
+    }
+}
+
+private struct AttachmentPreviewSheet: View {
+    let attachment: MaxAttachment
+    
+    @State private var isDownloading = false
+    @State private var downloadError: String?
+    @State private var downloadedFileURL: URL?
+    @State private var showShareSheet = false
+    @State private var showSaveSuccess = false
+
+    var body: some View {
+        NavigationStack {
+            Group {
+                if attachment.type.uppercased() == "PHOTO",
+                   let s = attachment.url,
+                   let url = URL(string: s) {
+                    ScrollView {
+                        AsyncImage(url: url) { phase in
+                            switch phase {
+                            case .success(let image):
+                                image
+                                    .resizable()
+                                    .scaledToFit()
+                                    .frame(maxWidth: .infinity)
+                            case .failure:
+                                ContentUnavailableView("Не удалось загрузить фото", systemImage: "photo.badge.exclamationmark")
+                                    .padding(.top, 32)
+                            default:
+                                ProgressView("Загрузка…")
+                                    .padding(.top, 32)
+                            }
+                        }
+                        .padding()
+                    }
+                    .background(Color(uiColor: .systemBackground))
+                } else {
+                    ContentUnavailableView(
+                        "Вложение",
+                        systemImage: "paperclip",
+                        description: Text(attachment.fileName ?? attachment.type)
+                    )
+                    .padding()
+                }
+            }
+            .navigationTitle(attachment.fileName ?? "Вложение")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Menu {
+                        Button {
+                            Task { await saveAttachment() }
+                        } label: {
+                            Label("Сохранить", systemImage: "square.and.arrow.down")
+                        }
+                        .disabled(isDownloading || attachment.url == nil)
+                        
+                        Button {
+                            Task { await shareAttachment() }
+                        } label: {
+                            Label("Отправить", systemImage: "square.and.arrow.up")
+                        }
+                        .disabled(isDownloading || attachment.url == nil)
+                    } label: {
+                        if isDownloading {
+                            ProgressView()
+                        } else {
+                            Image(systemName: "ellipsis.circle")
+                        }
+                    }
+                }
+            }
+            .alert("Ошибка", isPresented: .constant(downloadError != nil)) {
+                Button("OK") { downloadError = nil }
+            } message: {
+                if let error = downloadError {
+                    Text(error)
+                }
+            }
+            .alert("Сохранено", isPresented: $showSaveSuccess) {
+                Button("OK") { }
+            } message: {
+                Text("Вложение успешно сохранено")
+            }
+            .sheet(isPresented: $showShareSheet) {
+                if let fileURL = downloadedFileURL {
+                    ShareSheet(items: [fileURL])
+                }
+            }
+        }
+    }
+    
+    private func saveAttachment() async {
+        guard let urlString = attachment.url,
+              let url = URL(string: urlString) else {
+            await MainActor.run {
+                downloadError = "URL вложения недоступен"
+            }
+            return
+        }
+        
+        await MainActor.run {
+            isDownloading = true
+            downloadError = nil
+        }
+        
+        do {
+            let (data, _) = try await URLSession.shared.data(from: url)
+            
+            if attachment.type.uppercased() == "PHOTO" {
+                // Сохраняем фото в Photos library
+                let status = await PHPhotoLibrary.requestAuthorization(for: .addOnly)
+                guard status == .authorized || status == .limited else {
+                    await MainActor.run {
+                        isDownloading = false
+                        downloadError = "Необходим доступ к библиотеке фото"
+                    }
+                    return
+                }
+                
+                guard let image = UIImage(data: data) else {
+                    await MainActor.run {
+                        isDownloading = false
+                        downloadError = "Не удалось создать изображение"
+                    }
+                    return
+                }
+                
+                try await PHPhotoLibrary.shared().performChanges {
+                    PHAssetChangeRequest.creationRequestForAsset(from: image)
+                }
+                
+                await MainActor.run {
+                    isDownloading = false
+                    showSaveSuccess = true
+                }
+            } else {
+                // Сохраняем файл в Documents
+                let documentsPath = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+                let fileName = attachment.fileName ?? "attachment_\(attachment.id)"
+                let fileURL = documentsPath.appendingPathComponent(fileName)
+                
+                try data.write(to: fileURL)
+                
+                await MainActor.run {
+                    isDownloading = false
+                    showSaveSuccess = true
+                }
+            }
+        } catch {
+            await MainActor.run {
+                isDownloading = false
+                downloadError = "Не удалось сохранить: \(error.localizedDescription)"
+            }
+        }
+    }
+    
+    private func shareAttachment() async {
+        guard let urlString = attachment.url,
+              let url = URL(string: urlString) else {
+            await MainActor.run {
+                downloadError = "URL вложения недоступен"
+            }
+            return
+        }
+        
+        await MainActor.run {
+            isDownloading = true
+            downloadError = nil
+        }
+        
+        do {
+            let (data, _) = try await URLSession.shared.data(from: url)
+            
+            // Сохраняем во временный файл для sharing
+            let tempDir = FileManager.default.temporaryDirectory
+            let fileName = attachment.fileName ?? "attachment_\(attachment.id)"
+            let tempFileURL = tempDir.appendingPathComponent(fileName)
+            
+            try data.write(to: tempFileURL)
+            
+            await MainActor.run {
+                downloadedFileURL = tempFileURL
+                isDownloading = false
+                showShareSheet = true
+            }
+        } catch {
+            await MainActor.run {
+                isDownloading = false
+                downloadError = "Не удалось загрузить: \(error.localizedDescription)"
+            }
+        }
+    }
+}
+
+private struct ShareSheet: UIViewControllerRepresentable {
+    let items: [Any]
+    
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        let controller = UIActivityViewController(activityItems: items, applicationActivities: nil)
+        return controller
+    }
+    
+    func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {
     }
 }
 

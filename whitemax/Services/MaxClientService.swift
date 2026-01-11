@@ -16,6 +16,7 @@ class MaxClientService: ObservableObject {
     @Published var isInitialized = false
     @Published var isAuthenticated = false
     @Published var currentUser: MaxUser?
+    @Published private(set) var myUserId: Int?
     @Published var pymaxAvailable = false
 
     // Real-time events from Python wrapper
@@ -23,6 +24,7 @@ class MaxClientService: ObservableObject {
     @Published var updatedMessages: [MaxMessage] = []
     @Published var deletedMessageIds: [(chatId: Int, messageId: String)] = []
     @Published var reactionUpdates: [(chatId: Int, messageId: String, reaction: String?)] = []
+    @Published var chatUpdates: [MaxChat] = []
 
     // Local caches for UX (no extra permissions; stored in memory only)
     @Published private(set) var chatsCache: [Int: MaxChat] = [:]
@@ -76,9 +78,15 @@ class MaxClientService: ObservableObject {
             throw MaxClientError.notInitialized
         }
         
-        let workDirValue = workDir
+        // Always anchor python work_dir to app Documents to avoid "~" resolving differently on iOS.
+        let workDirValue: String? = {
+            if let workDir { return workDir }
+            let fm = FileManager.default
+            let docs = fm.urls(for: .documentDirectory, in: .userDomainMask).first
+            return docs?.appendingPathComponent("max_cache", isDirectory: true).path
+        }()
         let tokenValue = token
-        let jsonString = try PythonBridge.shared.withPython {
+        let jsonString = try await PythonBridge.shared.withPythonAsync {
             let workDirPython = workDirValue != nil ? PythonObject(workDirValue!) : PythonObject(Python.None)
             let tokenPython = tokenValue != nil ? PythonObject(tokenValue!) : PythonObject(Python.None)
             let result = module.create_wrapper(phone, workDirPython, tokenPython)
@@ -94,7 +102,9 @@ class MaxClientService: ObservableObject {
         if !success {
             let error = json["error"] as? String ?? "Unknown error"
             if error.contains("pymax not available") {
-                throw MaxClientError.pymaxNotAvailable
+                let details = json["details"] as? String
+                let msg = details != nil ? "\(error)\n\n\(details!)" : error
+                throw MaxClientError.wrapperCreationFailed(msg)
             }
             throw MaxClientError.wrapperCreationFailed(error)
         }
@@ -102,7 +112,7 @@ class MaxClientService: ObservableObject {
     
     func requestCode(phone: String? = nil, language: String = "ru") async throws -> String {
         let phoneValue = phone
-        let jsonString = try PythonBridge.shared.withPython {
+        let jsonString = try await PythonBridge.shared.withPythonAsync {
             guard let module = self.wrapperModule else {
                 return "{\"success\": false, \"error\": \"Module not initialized\"}"
             }
@@ -134,7 +144,7 @@ class MaxClientService: ObservableObject {
             throw MaxClientError.notInitialized
         }
         
-        let jsonString = try PythonBridge.shared.withPython {
+        let jsonString = try await PythonBridge.shared.withPythonAsync {
             guard let module = self.wrapperModule else {
                 return "{\"success\": false, \"error\": \"Module not initialized\"}"
             }
@@ -173,12 +183,19 @@ class MaxClientService: ObservableObject {
             let firstName = me["first_name"] as? String ?? "User"
             let user = MaxUser(id: id, firstName: firstName)
             currentUser = user
+            myUserId = id
+            UserDefaults.standard.set(id, forKey: "max_user_id")
             return user
         }
         
         // Если me отсутствует, но токен сохранен, это не критическая ошибка
         // Просто не устанавливаем currentUser
-        return MaxUser(id: 0, firstName: "Unknown")
+        // Keep stable outgoing detection even if "me" isn't returned yet
+        let savedId = UserDefaults.standard.object(forKey: "max_user_id") as? Int
+        if let savedId {
+            myUserId = savedId
+        }
+        return MaxUser(id: savedId ?? 0, firstName: "Unknown")
     }
     
     func getChats() async throws -> [MaxChat] {
@@ -186,7 +203,7 @@ class MaxClientService: ObservableObject {
             throw MaxClientError.notInitialized
         }
         
-        let jsonString = try PythonBridge.shared.withPython {
+        let jsonString = try await PythonBridge.shared.withPythonAsync {
             guard let module = self.wrapperModule else {
                 return "{\"success\": false, \"error\": \"Module not initialized\"}"
             }
@@ -208,7 +225,7 @@ class MaxClientService: ObservableObject {
             return []
         }
         
-        let chats = chatsArray.compactMap { (chatDict: [String: Any]) -> MaxChat? in
+        let chatsRaw = chatsArray.compactMap { (chatDict: [String: Any]) -> MaxChat? in
             guard let id = chatDict["id"] as? Int,
                   let title = chatDict["title"] as? String else {
                 return nil
@@ -228,8 +245,20 @@ class MaxClientService: ObservableObject {
                 unreadCount: unreadCount
             )
         }
-        chatsCache = Dictionary(uniqueKeysWithValues: chats.map { ($0.id, $0) })
-        return chats
+        
+        // Defensive: backend/wrapper can occasionally return duplicates (same id).
+        // Never crash here; keep the last occurrence.
+        chatsCache = Dictionary(chatsRaw.map { ($0.id, $0) }, uniquingKeysWith: { _, new in new })
+        
+        // Also dedupe the list we return (keeps first seen order, replaces by last data).
+        var seen = Set<Int>()
+        var out: [MaxChat] = []
+        for c in chatsRaw {
+            if seen.contains(c.id) { continue }
+            seen.insert(c.id)
+            out.append(c)
+        }
+        return out
     }
     
     func getMessages(chatId: Int, limit: Int = 50) async throws -> [MaxMessage] {
@@ -237,7 +266,7 @@ class MaxClientService: ObservableObject {
             throw MaxClientError.notInitialized
         }
         
-        let jsonString = try PythonBridge.shared.withPython {
+        let jsonString = try await PythonBridge.shared.withPythonAsync {
             guard let module = self.wrapperModule else {
                 return "{\"success\": false, \"error\": \"Module not initialized\"}"
             }
@@ -334,7 +363,7 @@ class MaxClientService: ObservableObject {
             throw MaxClientError.notInitialized
         }
 
-        let jsonString = try PythonBridge.shared.withPython {
+        let jsonString = try await PythonBridge.shared.withPythonAsync {
             let replyPy = replyTo != nil ? PythonObject(replyTo!) : PythonObject(Python.None)
             let result = module.send_message(chatId, text, replyPy)
             return String(result) ?? "{}"
@@ -379,7 +408,7 @@ class MaxClientService: ObservableObject {
             throw MaxClientError.notInitialized
         }
 
-        let jsonString = try PythonBridge.shared.withPython {
+        let jsonString = try await PythonBridge.shared.withPythonAsync {
             let replyPy = replyTo != nil ? PythonObject(replyTo!) : PythonObject(Python.None)
             let result = module.send_attachment(chatId, filePath, attachmentType, text, replyPy, notify)
             return String(result) ?? "{}"
@@ -417,7 +446,7 @@ class MaxClientService: ObservableObject {
             throw MaxClientError.notInitialized
         }
 
-        let jsonString = try PythonBridge.shared.withPython {
+        let jsonString = try await PythonBridge.shared.withPythonAsync {
             let result = module.edit_message(chatId, messageId, text)
             return String(result) ?? "{}"
         }
@@ -454,7 +483,7 @@ class MaxClientService: ObservableObject {
             throw MaxClientError.notInitialized
         }
 
-        let jsonString = try PythonBridge.shared.withPython {
+        let jsonString = try await PythonBridge.shared.withPythonAsync {
             // pass list as Python list
             let idsPy = PythonObject(messageIds)
             let result = module.delete_message(chatId, idsPy, forMe)
@@ -480,7 +509,7 @@ class MaxClientService: ObservableObject {
             throw MaxClientError.notInitialized
         }
 
-        let jsonString = try PythonBridge.shared.withPython {
+        let jsonString = try await PythonBridge.shared.withPythonAsync {
             let result = module.add_reaction(chatId, messageId, reaction)
             return String(result) ?? "{}"
         }
@@ -504,7 +533,7 @@ class MaxClientService: ObservableObject {
             throw MaxClientError.notInitialized
         }
 
-        let jsonString = try PythonBridge.shared.withPython {
+        let jsonString = try await PythonBridge.shared.withPythonAsync {
             let result = module.remove_reaction(chatId, messageId)
             return String(result) ?? "{}"
         }
@@ -528,7 +557,7 @@ class MaxClientService: ObservableObject {
             throw MaxClientError.notInitialized
         }
 
-        let jsonString = try PythonBridge.shared.withPython {
+        let jsonString = try await PythonBridge.shared.withPythonAsync {
             let result = module.pin_message(chatId, messageId, notifyPin)
             return String(result) ?? "{}"
         }
@@ -552,7 +581,7 @@ class MaxClientService: ObservableObject {
             throw MaxClientError.notInitialized
         }
 
-        let jsonString = try PythonBridge.shared.withPython {
+        let jsonString = try await PythonBridge.shared.withPythonAsync {
             let result = module.upload_photo(filePath)
             return String(result) ?? "{}"
         }
@@ -581,7 +610,7 @@ class MaxClientService: ObservableObject {
             throw MaxClientError.notInitialized
         }
 
-        let jsonString = try PythonBridge.shared.withPython {
+        let jsonString = try await PythonBridge.shared.withPythonAsync {
             let result = module.upload_file(filePath)
             return String(result) ?? "{}"
         }
@@ -613,7 +642,7 @@ class MaxClientService: ObservableObject {
             throw MaxClientError.notInitialized
         }
 
-        let jsonString = try PythonBridge.shared.withPython {
+        let jsonString = try await PythonBridge.shared.withPythonAsync {
             let last = lastName != nil ? PythonObject(lastName!) : PythonObject(Python.None)
             let desc = about != nil ? PythonObject(about!) : PythonObject(Python.None)
             let photo = photoPath != nil ? PythonObject(photoPath!) : PythonObject(Python.None)
@@ -647,7 +676,7 @@ class MaxClientService: ObservableObject {
             throw MaxClientError.notInitialized
         }
 
-        let jsonString = try PythonBridge.shared.withPython {
+        let jsonString = try await PythonBridge.shared.withPythonAsync {
             let result = module.get_folders(folderSync)
             return String(result) ?? "{}"
         }
@@ -673,7 +702,7 @@ class MaxClientService: ObservableObject {
             throw MaxClientError.notInitialized
         }
 
-        let jsonString = try PythonBridge.shared.withPython {
+        let jsonString = try await PythonBridge.shared.withPythonAsync {
             let result = module.search_by_phone(phone)
             return String(result) ?? "{}"
         }
@@ -705,7 +734,7 @@ class MaxClientService: ObservableObject {
             throw MaxClientError.notInitialized
         }
 
-        let jsonString = try PythonBridge.shared.withPython {
+        let jsonString = try await PythonBridge.shared.withPythonAsync {
             let result = module.resolve_channel_by_name(name)
             return String(result) ?? "{}"
         }
@@ -733,12 +762,42 @@ class MaxClientService: ObservableObject {
         return MaxChat(id: id, title: title, type: "CHANNEL", photoId: nil, iconUrl: iconUrl, unreadCount: 0)
     }
 
+    func getPrivateChatWithUser(_ user: MaxUser) async throws -> MaxChat {
+        guard let myId = currentUser?.id else {
+            throw MaxClientError.missingToken
+        }
+        
+        // Вычисляем ID приватного чата: first_user_id ^ second_user_id
+        let chatId = myId ^ user.id
+        
+        // Проверяем, есть ли уже такой чат в кеше
+        if let existingChat = chatsCache[chatId] {
+            return existingChat
+        }
+        
+        // Если чата нет в кеше, загружаем список чатов и ищем его там
+        let allChats = try await getChats()
+        if let foundChat = allChats.first(where: { $0.id == chatId }) {
+            return foundChat
+        }
+        
+        // Если чата нет, создаем новый объект чата (диалог будет создан автоматически при отправке первого сообщения)
+        return MaxChat(
+            id: chatId,
+            title: user.firstName,
+            type: "DIALOG",
+            photoId: nil,
+            iconUrl: nil,
+            unreadCount: 0
+        )
+    }
+
     func createFolder(title: String, chatInclude: [Int]) async throws {
         guard let module = wrapperModule else {
             throw MaxClientError.notInitialized
         }
 
-        let jsonString = try PythonBridge.shared.withPython {
+        let jsonString = try await PythonBridge.shared.withPythonAsync {
             let includePy = PythonObject(chatInclude)
             let result = module.create_folder(title, includePy)
             return String(result) ?? "{}"
@@ -760,7 +819,7 @@ class MaxClientService: ObservableObject {
             throw MaxClientError.notInitialized
         }
 
-        let jsonString = try PythonBridge.shared.withPython {
+        let jsonString = try await PythonBridge.shared.withPythonAsync {
             let includePy = chatInclude != nil ? PythonObject(chatInclude!) : PythonObject(Python.None)
             let result = module.update_folder(folderId, title, includePy)
             return String(result) ?? "{}"
@@ -782,7 +841,7 @@ class MaxClientService: ObservableObject {
             throw MaxClientError.notInitialized
         }
 
-        let jsonString = try PythonBridge.shared.withPython {
+        let jsonString = try await PythonBridge.shared.withPythonAsync {
             let result = module.delete_folder(folderId)
             return String(result) ?? "{}"
         }
@@ -803,7 +862,7 @@ class MaxClientService: ObservableObject {
             throw MaxClientError.notInitialized
         }
 
-        let jsonString = try PythonBridge.shared.withPython {
+        let jsonString = try await PythonBridge.shared.withPythonAsync {
             let result = module.join_group(link)
             return String(result) ?? "{}"
         }
@@ -834,7 +893,7 @@ class MaxClientService: ObservableObject {
             throw MaxClientError.notInitialized
         }
 
-        let jsonString = try PythonBridge.shared.withPython {
+        let jsonString = try await PythonBridge.shared.withPythonAsync {
             let result = module.join_channel(link)
             return String(result) ?? "{}"
         }
@@ -865,7 +924,7 @@ class MaxClientService: ObservableObject {
             throw MaxClientError.notInitialized
         }
 
-        let jsonString = try PythonBridge.shared.withPython {
+        let jsonString = try await PythonBridge.shared.withPythonAsync {
             let result = module.leave_group(chatId)
             return String(result) ?? "{}"
         }
@@ -886,7 +945,7 @@ class MaxClientService: ObservableObject {
             throw MaxClientError.notInitialized
         }
 
-        let jsonString = try PythonBridge.shared.withPython {
+        let jsonString = try await PythonBridge.shared.withPythonAsync {
             let result = module.leave_channel(chatId)
             return String(result) ?? "{}"
         }
@@ -907,7 +966,7 @@ class MaxClientService: ObservableObject {
             throw MaxClientError.notInitialized
         }
 
-        let jsonString = try PythonBridge.shared.withPython {
+        let jsonString = try await PythonBridge.shared.withPythonAsync {
             let result = module.read_message(chatId, messageId)
             return String(result) ?? "{}"
         }
@@ -938,7 +997,7 @@ class MaxClientService: ObservableObject {
             try await createWrapper(phone: phone, token: token)
         }
         
-        let jsonString = try PythonBridge.shared.withPython {
+        let jsonString = try await PythonBridge.shared.withPythonAsync {
             guard let module = self.wrapperModule else {
                 return "{\"success\": false, \"error\": \"Module not initialized\"}"
             }
@@ -970,7 +1029,12 @@ class MaxClientService: ObservableObject {
            let id = me["id"] as? Int,
            let firstName = me["first_name"] as? String {
             currentUser = MaxUser(id: id, firstName: firstName)
+            myUserId = id
+            UserDefaults.standard.set(id, forKey: "max_user_id")
         }
+
+        // Best-effort: enable events right after client start so UI gets real-time updates.
+        try? await startEventMonitoring()
     }
 
     func startEventMonitoring(eventsDir: String? = nil) async throws {
@@ -979,8 +1043,15 @@ class MaxClientService: ObservableObject {
         }
 
         // Ask Python wrapper to register callbacks + tell us events dir
-        let jsonString = try PythonBridge.shared.withPython {
-            let dirPy = eventsDir != nil ? PythonObject(eventsDir!) : PythonObject(Python.None)
+        let jsonString = try await PythonBridge.shared.withPythonAsync {
+            // Anchor events dir to Documents/max_cache/events by default, so Swift and Python always agree.
+            let dir: String? = {
+                if let eventsDir { return eventsDir }
+                let fm = FileManager.default
+                let docs = fm.urls(for: .documentDirectory, in: .userDomainMask).first
+                return docs?.appendingPathComponent("max_cache/events", isDirectory: true).path
+            }()
+            let dirPy = dir != nil ? PythonObject(dir!) : PythonObject(Python.None)
             let result = module.register_event_callbacks(dirPy)
             return String(result) ?? "{}"
         }
@@ -1040,6 +1111,17 @@ class MaxClientService: ObservableObject {
                 let reaction = info?["your_reaction"] as? String
                 reactionUpdates.append((chatId: chatId, messageId: messageId, reaction: reaction))
             }
+        case "chat_update":
+            if let raw = event["chat"] as? [String: Any],
+               let id = raw["id"] as? Int {
+                let title = (raw["title"] as? String) ?? ""
+                let type = (raw["type"] as? String) ?? "unknown"
+                let iconUrl = raw["icon_url"] as? String
+                let updated = MaxChat(id: id, title: title, type: type, photoId: nil, iconUrl: iconUrl, unreadCount: 0)
+                // Keep cache in sync for other screens (best-effort)
+                chatsCache[id] = updated
+                chatUpdates.append(updated)
+            }
         default:
             break
         }
@@ -1093,7 +1175,7 @@ class MaxClientService: ObservableObject {
             throw MaxClientError.notInitialized
         }
         
-        let jsonString = try PythonBridge.shared.withPython {
+        let jsonString = try await PythonBridge.shared.withPythonAsync {
             guard let module = self.wrapperModule else {
                 return "{\"success\": false, \"error\": \"Module not initialized\"}"
             }
@@ -1158,9 +1240,7 @@ enum MaxClientError: LocalizedError {
         case .pymaxNotAvailable:
             return "pymax not available - missing dependencies (pydantic-core required)"
         case .wrapperCreationFailed(let message):
-            if message.contains("pymax not available") {
-                return "pymax not available - missing dependencies"
-            }
+            // Do not hide diagnostics. We rely on wrapper-provided details (e.g. OSError/dlopen).
             return "Failed to create wrapper: \(message)"
         case .requestCodeFailed(let message):
             return "Failed to request code: \(message)"

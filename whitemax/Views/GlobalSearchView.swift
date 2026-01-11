@@ -7,7 +7,6 @@ import SwiftUI
 
 struct GlobalSearchView: View {
     @StateObject private var service = MaxClientService.shared
-    @AppStorage("private_mode") private var privateMode: Bool = false
 
     @State private var query: String = ""
     @State private var isSearching: Bool = false
@@ -33,12 +32,6 @@ struct GlobalSearchView: View {
                     }
                 }
                 .disabled(isSearching || query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-
-                if privateMode {
-                    Text("Private Mode: поиск делается только по явному нажатию «Искать».")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
             }
 
             if let errorMessage {
@@ -51,14 +44,16 @@ struct GlobalSearchView: View {
 
             if let userResult {
                 Section("Пользователь") {
-                    HStack {
-                        Image(systemName: "person.crop.circle")
-                            .imageScale(.large)
-                        Text(userResult.firstName)
-                        Spacer()
-                        Text("#\(userResult.id)")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                    NavigationLink(destination: PrivateChatLoaderView(user: userResult)) {
+                        HStack {
+                            Image(systemName: "person.crop.circle")
+                                .imageScale(.large)
+                            Text(userResult.firstName)
+                            Spacer()
+                            Text("#\(userResult.id)")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
                     }
                 }
             }
@@ -80,17 +75,6 @@ struct GlobalSearchView: View {
             }
         }
         .navigationTitle("Поиск")
-        .onChange(of: query) { _, newValue in
-            guard !privateMode else { return }
-            // In non-private mode we can be more responsive: small debounce would be nicer,
-            // but keep it simple for now: only auto-search when query looks complete.
-            let q = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
-            if q.hasPrefix("+") && q.count >= 7 {
-                search()
-            } else if q.hasPrefix("@") && q.count >= 3 {
-                search()
-            }
-        }
     }
 
     private func search() {
@@ -125,3 +109,37 @@ struct GlobalSearchView: View {
     }
 }
 
+private struct PrivateChatLoaderView: View {
+    let user: MaxUser
+    @StateObject private var service = MaxClientService.shared
+    @State private var chat: MaxChat?
+    @State private var errorMessage: String?
+    
+    var body: some View {
+        Group {
+            if let chat = chat {
+                MessagesView(chat: chat)
+            } else if let errorMessage = errorMessage {
+                ContentUnavailableView(
+                    "Ошибка",
+                    systemImage: "exclamationmark.triangle",
+                    description: Text(errorMessage)
+                )
+            } else {
+                ProgressView("Загрузка чата…")
+            }
+        }
+        .task {
+            do {
+                let loadedChat = try await service.getPrivateChatWithUser(user)
+                await MainActor.run {
+                    chat = loadedChat
+                }
+            } catch {
+                await MainActor.run {
+                    errorMessage = error.localizedDescription
+                }
+            }
+        }
+    }
+}

@@ -4,6 +4,7 @@ Python обертка для Swift для работы с pymax.
 """
 
 import asyncio
+import concurrent.futures
 import datetime
 import json
 import os
@@ -11,6 +12,7 @@ import ssl
 import sys
 import time
 import uuid
+import threading
 from typing import Any, Dict, List, Optional
 
 # Добавляем текущую директорию в sys.path для поиска модулей
@@ -20,12 +22,23 @@ if _current_dir not in sys.path:
 
 PYMAX_AVAILABLE = False
 _DEBUG = os.environ.get("WHITEMAX_DEBUG") == "1"
+_PYMAX_IMPORT_ERROR: Optional[str] = None
 
 
 def _dprint(*args: Any, **kwargs: Any) -> None:
     if _DEBUG:
         print(*args, **kwargs)
+
+
+def _set_import_error(prefix: str, err: Exception) -> None:
+    global _PYMAX_IMPORT_ERROR
+    if _PYMAX_IMPORT_ERROR is None:
+        _PYMAX_IMPORT_ERROR = f"{prefix}: {type(err).__name__}: {err}"
 try:
+    # pydantic-core is required by pydantic v2 (pymax dependencies).
+    # On-device failures are often OSError/dlopen (not just ImportError).
+    import pydantic_core  # noqa: F401
+
     # Пытаемся импортировать pymax
     # Для iOS используем SocketMaxClient вместо MaxClient
     from pymax import SocketMaxClient
@@ -35,12 +48,13 @@ try:
     from pymax.exceptions import SocketNotConnectedError, SocketSendError
     PYMAX_AVAILABLE = True
     _dprint("✓ pymax imported successfully")
-except ImportError as e:
+except Exception as e:
     # Если импорт не удался, создаем заглушки для типов
     import sys
     import os
     import traceback
     
+    _set_import_error("Failed to import pymax/pydantic_core", e)
     _dprint(f"Warning: Failed to import pymax: {e}")
     _dprint(f"Error type: {type(e).__name__}")
     _dprint(f"Python path: {sys.path}")
@@ -180,6 +194,14 @@ class MaxClientWrapper:
                     if a_type_str.upper() == "PHOTO":
                         photo_id = self._get_field(a, "photo_id", "photoId", default=None)
                         base_url = self._get_field(a, "base_url", "baseUrl", default=None)
+                        # Cache-buster: AsyncImage caches by URL; some base URLs can be template-like.
+                        if base_url:
+                            try:
+                                sep = "&" if "?" in str(base_url) else "?"
+                                pid = int(photo_id) if photo_id is not None else 0
+                                base_url = f"{base_url}{sep}pid={pid}&mid={str(msg_id)}"
+                            except Exception:
+                                pass
                         attachments.append(
                             {
                                 "id": int(photo_id) if photo_id is not None else 0,
@@ -271,24 +293,34 @@ class MaxClientWrapper:
         if self.client is None:
             raise RuntimeError("Client not initialized")
 
-        if not getattr(self.client, "is_connected", False):
-            # Закрываем старое соединение если есть
-            if hasattr(self.client, "_socket") and getattr(self.client, "_socket", None):
+        if self._conn_lock is None:
+            self._conn_lock = asyncio.Lock()
+
+        async with self._conn_lock:
+            if not getattr(self.client, "is_connected", False):
+                # Best-effort cleanup: cancel recv/outgoing tasks before reconnecting.
+                # This avoids accumulating pending tasks and improves reconnect stability.
                 try:
-                    self.client._socket.close()
+                    if hasattr(self.client, "_cleanup_client"):
+                        await self.client._cleanup_client()
                 except Exception:
-                    pass
-            self.client.is_connected = False
+                    # fallback: close socket only
+                    if hasattr(self.client, "_socket") and getattr(self.client, "_socket", None):
+                        try:
+                            self.client._socket.close()
+                        except Exception:
+                            pass
+                    self.client.is_connected = False
 
-            await self.client.connect(self.client.user_agent)
+                await self.client.connect(self.client.user_agent)
 
-            if getattr(self.client, "_token", None):
+                if getattr(self.client, "_token", None):
+                    await self.client._sync(self.client.user_agent)
+                    await self.client._post_login_tasks(sync=False)
+
+            elif getattr(self.client, "_token", None) and not getattr(self.client, "me", None):
                 await self.client._sync(self.client.user_agent)
                 await self.client._post_login_tasks(sync=False)
-
-        elif getattr(self.client, "_token", None) and not getattr(self.client, "me", None):
-            await self.client._sync(self.client.user_agent)
-            await self.client._post_login_tasks(sync=False)
 
     def _reaction_info_to_dict(self, reaction_info: Any) -> Optional[Dict[str, Any]]:
         """Конвертировать ReactionInfo в JSON-совместимый dict для Swift."""
@@ -393,6 +425,11 @@ class MaxClientWrapper:
             self.client.on_chat_update(_on_chat_update)
 
             self._callbacks_registered = True
+            # Ensure background keepalive so events arrive even when Swift is idle.
+            try:
+                self._run_async(self._ensure_keepalive_started())
+            except Exception:
+                pass
             return {"success": True, "events_dir": self._events_dir}
         except Exception as e:
             return {"success": False, "error": str(e)}
@@ -418,38 +455,158 @@ class MaxClientWrapper:
         self.work_dir = work_dir
         self.token = token
         self.client: Optional[SocketMaxClient] = None
+        # IMPORTANT (stability):
+        # pymax (SocketMaxClient) starts long-lived asyncio Tasks for socket recv/outgoing loops.
+        # If we execute coroutines via loop.run_until_complete(), the event loop stops afterwards and
+        # those tasks get destroyed => frequent disconnect/reconnect storms + "Task was destroyed" warnings.
+        #
+        # We keep a dedicated asyncio loop running forever in a Python background thread and schedule
+        # coroutines onto it via asyncio.run_coroutine_threadsafe(). Swift/PythonKit still calls into
+        # Python only from ONE Swift thread (enforced by PythonBridge.withPython).
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._loop_thread: Optional[threading.Thread] = None
+        self._loop_ready = threading.Event()
+        self._loop_lock = threading.Lock()
+        self._loop_thread_ident: Optional[int] = None
         self._events_dir: str = os.path.join(self.work_dir, "events")
         self._callbacks_registered: bool = False
+        self._conn_lock: Optional[asyncio.Lock] = None
+        self._keepalive_task: Optional[asyncio.Task] = None
+        self._keepalive_stop: Optional[asyncio.Event] = None
+
+    async def _keepalive_loop(self) -> None:
+        """
+        Background loop that keeps the socket/session alive for real-time events.
+        Runs on our dedicated asyncio loop thread.
+        """
+        if self.client is None:
+            return
+        if self._keepalive_stop is None:
+            self._keepalive_stop = asyncio.Event()
+
+        # Small initial delay to let login/start flows settle.
+        await asyncio.sleep(0.2)
+        while not self._keepalive_stop.is_set():
+            try:
+                # Only keepalive if we have auth token; otherwise no realtime.
+                if getattr(self.client, "_token", None):
+                    # Ensure connected + session (sync/post_login tasks) so server delivers push events.
+                    await self._ensure_connected_and_session()
+                await asyncio.sleep(1.0)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                # Never crash keepalive; back off a bit.
+                try:
+                    await asyncio.sleep(1.5)
+                except Exception:
+                    pass
+
+    async def _ensure_keepalive_started(self) -> None:
+        """Start keepalive task once (best-effort)."""
+        if self.client is None:
+            return
+        if self._keepalive_stop is None:
+            self._keepalive_stop = asyncio.Event()
+        if self._keepalive_task is not None and not self._keepalive_task.done():
+            return
+        # Reset stop flag if previously stopped
+        try:
+            self._keepalive_stop.clear()
+        except Exception:
+            self._keepalive_stop = asyncio.Event()
+        self._keepalive_task = asyncio.create_task(self._keepalive_loop(), name="whitemax-keepalive")
+
+    def _ensure_loop_thread(self) -> asyncio.AbstractEventLoop:
+        """Ensure a dedicated asyncio loop thread is running; return the loop."""
+        with self._loop_lock:
+            if (
+                self._loop_thread is not None
+                and self._loop is not None
+                and not self._loop.is_closed()
+                and self._loop.is_running()
+            ):
+                return self._loop
+
+            # Reset state
+            self._loop_ready.clear()
+            self._loop = None
+            self._loop_thread_ident = None
+
+            def _worker() -> None:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                self._loop = loop
+                self._loop_thread_ident = threading.get_ident()
+                self._loop_ready.set()
+                try:
+                    loop.run_forever()
+                finally:
+                    # Best-effort: cancel pending tasks to avoid "Task was destroyed but it is pending!"
+                    try:
+                        pending = asyncio.all_tasks(loop)
+                        for t in pending:
+                            t.cancel()
+                        if pending:
+                            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                    except Exception:
+                        pass
+                    try:
+                        loop.close()
+                    except Exception:
+                        pass
+
+            t = threading.Thread(target=_worker, name="whitemax-asyncio-loop", daemon=True)
+            self._loop_thread = t
+            t.start()
+
+        # Wait outside lock
+        self._loop_ready.wait(timeout=2.0)
+        if self._loop is None:
+            raise RuntimeError("Failed to start asyncio loop thread")
+        return self._loop
+
+    def _stop_loop_thread(self) -> None:
+        """Stop dedicated asyncio loop thread (best-effort)."""
+        with self._loop_lock:
+            loop = self._loop
+            t = self._loop_thread
+
+        if loop is not None and not loop.is_closed():
+            try:
+                loop.call_soon_threadsafe(loop.stop)
+            except Exception:
+                pass
+
+        if t is not None and t.is_alive():
+            try:
+                t.join(timeout=1.5)
+            except Exception:
+                pass
+
+        with self._loop_lock:
+            self._loop_thread = None
+            self._loop_thread_ident = None
+            self._loop = None
+            self._loop_ready.clear()
         
     def _get_loop(self) -> asyncio.AbstractEventLoop:
         """Получить или создать event loop."""
-        if self._loop is None or self._loop.is_closed():
-            try:
-                self._loop = asyncio.get_event_loop()
-            except RuntimeError:
-                self._loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(self._loop)
-        return self._loop
+        return self._ensure_loop_thread()
     
     def _run_async(self, coro):
-        """Запустить асинхронную функцию синхронно."""
-        # Для стабильной работы SocketMaxClient важно переиспользовать один event loop,
-        # иначе объекты сокета/transport могут оказаться привязаны к закрытому loop.
-        loop = self._get_loop()
+        """Run an async coroutine synchronously without stopping the asyncio loop."""
+        loop = self._ensure_loop_thread()
         try:
-            if loop.is_running():
-                # Если loop уже запущен в текущем потоке, то запускаем coro в отдельном потоке
-                # через asyncio.run(). (Редкий кейс для нашей интеграции, но пусть будет безопасно.)
-                import concurrent.futures
+            # If called from loop thread, this sync API would deadlock.
+            if self._loop_thread_ident is not None and threading.get_ident() == self._loop_thread_ident:
+                raise RuntimeError("_run_async called from asyncio loop thread")
 
-                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                    future = executor.submit(asyncio.run, coro)
-                    return future.result(timeout=60)  # Таймаут 60 секунд
-
-            # Обычный синхронный вызов: выполняем coroutine в нашем стабильном loop
-            asyncio.set_event_loop(loop)
-            return loop.run_until_complete(coro)
+            fut = asyncio.run_coroutine_threadsafe(coro, loop)
+            return fut.result(timeout=60)
+        except concurrent.futures.TimeoutError as e:
+            _dprint("Error in _run_async: timeout")
+            raise TimeoutError("Python async call timed out") from e
         except Exception as e:
             _dprint(f"Error in _run_async: {e}")
             if _DEBUG:
@@ -669,6 +826,19 @@ class MaxClientWrapper:
                     )
                     _dprint(f"✗ {error_msg}")
                     return {"success": False, "error": error_msg}
+
+                # Initialize session right after login so realtime events work without extra UI calls.
+                try:
+                    await self.client._sync(self.client.user_agent)
+                    await self.client._post_login_tasks(sync=False)
+                except Exception as e:
+                    _dprint(f"Warning: post-login init failed: {e}")
+
+                # Start background keepalive/reconnect loop (best-effort)
+                try:
+                    await self._ensure_keepalive_started()
+                except Exception:
+                    pass
                 
                 # Получаем информацию о текущем пользователе
                 me_info = None
@@ -711,26 +881,8 @@ class MaxClientWrapper:
         
         try:
             async def _get_chats():
-                # Ensure connected + session initialized
-                # Убеждаемся, что Socket подключен
-                if not self.client.is_connected:
-                    try:
-                        await self.client.connect(self.client.user_agent)
-                        # Если есть токен, нужно инициализировать сессию
-                        if self.client._token:
-                            await self.client._sync(self.client.user_agent)
-                            await self.client._post_login_tasks(sync=False)
-                    except Exception as conn_error:
-                        # Если соединение не удалось, пробуем еще раз
-                        await asyncio.sleep(0.5)
-                        await self.client.connect(self.client.user_agent)
-                        if self.client._token:
-                            await self.client._sync(self.client.user_agent)
-                            await self.client._post_login_tasks(sync=False)
-                elif self.client._token and not self.client.me:
-                    # Если подключены, но сессия не инициализирована, инициализируем
-                    await self.client._sync(self.client.user_agent)
-                    await self.client._post_login_tasks(sync=False)
+                # Ensure connected + session initialized (also prevents concurrent connect storms)
+                await self._ensure_connected_and_session()
 
                 # Важно: для нормальных имён диалогов нужно подтянуть пользователей по cid.
                 # pymax умеет это через get_users() (CONTACT_INFO).
@@ -739,78 +891,193 @@ class MaxClientWrapper:
                     # Убираем дубли и None
                     unique_cids = sorted({int(x) for x in cids if x is not None})
                     if unique_cids:
+                        # Загружаем пользователей и ждем завершения
                         await self.client.get_users(unique_cids)
-                except Exception:
+                        # Даем немного времени на обновление кеша
+                        await asyncio.sleep(0.1)
+                except Exception as e:
                     # best-effort: не ломаем список чатов, если CONTACT_INFO упал
+                    _dprint(f"Warning: Failed to load users: {e}")
                     pass
                 
                 # Собираем все типы чатов: диалоги, чаты и каналы
-                all_chats = []
+                # IMPORTANT: IDs can appear in multiple sources (e.g. channels are also in chats list),
+                # so we must dedupe by id to keep Swift stable.
+                prio = {"DIALOG": 0, "CHAT": 1, "CHANNEL": 2}
+                by_id: Dict[int, Dict[str, Any]] = {}
+
+                def _upsert(cd: Dict[str, Any]) -> None:
+                    try:
+                        cid = int(cd.get("id"))
+                    except Exception:
+                        return
+                    cur = by_id.get(cid)
+                    if cur is None:
+                        by_id[cid] = cd
+                        return
+                    cur_type = str(cur.get("type") or "unknown").upper()
+                    new_type = str(cd.get("type") or "unknown").upper()
+                    if prio.get(new_type, -1) > prio.get(cur_type, -1):
+                        by_id[cid] = cd
+                        return
+                    # Otherwise keep current, but fill missing fields from new.
+                    if not (cur.get("title") or "") and (cd.get("title") or ""):
+                        cur["title"] = cd.get("title")
+                    if cur.get("icon_url") is None and cd.get("icon_url") is not None:
+                        cur["icon_url"] = cd.get("icon_url")
+                    if cur.get("photo_id") is None and cd.get("photo_id") is not None:
+                        cur["photo_id"] = cd.get("photo_id")
                 
                 # Добавляем диалоги
                 for dialog in self.client.dialogs:
-                    # Получаем название диалога (обычно имя собеседника)
-                    title = f"Dialog {dialog.id}"
+                    # Название диалога (обычно имя собеседника)
+                    title: str = ""
                     photo_id = None
+                    icon_url = None
                     
-                    # Пытаемся получить имя из участников
-                    # Для диалога cid обычно ID собеседника
-                    if dialog.cid:
+                    # Determine peer id for dialog.
+                    # Prefer participants != me.id (more reliable than cid), fallback to dialog.cid.
+                    me_id = self._get_field(self.client.me, "id", default=None) if getattr(self.client, "me", None) else None
+                    peer_id = None
+                    parts = self._get_field(dialog, "participants", default=None)
+                    if me_id is not None and isinstance(parts, dict):
+                        try:
+                            for k in parts.keys():
+                                try:
+                                    pid = int(k)
+                                except Exception:
+                                    continue
+                                if int(pid) != int(me_id):
+                                    peer_id = int(pid)
+                                    break
+                        except Exception:
+                            peer_id = None
+
+                    if peer_id is None and getattr(dialog, "cid", None) is not None:
+                        try:
+                            peer_id = int(dialog.cid)
+                        except Exception:
+                            peer_id = None
+
+                    if peer_id is not None:
                         try:
                             # Получаем пользователя по ID из _users
-                            if dialog.cid in self.client._users:
-                                user = self.client._users[dialog.cid]
+                            user = self.client._users.get(peer_id)
+                            
+                            # Если пользователь не найден в кеше, пытаемся загрузить его
+                            if user is None:
+                                try:
+                                    users = await self.client.get_users([peer_id])
+                                    if users and len(users) > 0:
+                                        user = users[0]
+                                        # Обновляем кеш
+                                        self.client._users[peer_id] = user
+                                except Exception as load_error:
+                                    _dprint(f"Warning: Failed to load user {peer_id}: {load_error}")
+                            
+                            if user is not None:
+                                # Пытаемся получить имя из разных источников
                                 user_names = self._get_field(user, "names", default=None)
                                 if user_names and isinstance(user_names, list) and len(user_names) > 0:
-                                    n0 = user_names[0]
+                                    # Проверяем все имена в списке
+                                    for name_obj in user_names:
+                                        # Пробуем разные варианты полей
+                                        name = (
+                                            self._get_field(name_obj, "name", default=None)
+                                            or self._get_field(name_obj, "first_name", "firstName", default=None)
+                                            or None
+                                        )
+                                        if name and name.strip():
+                                            title = name.strip()
+                                            break
+                                
+                                # Если имя не найдено в names, пробуем другие поля
+                                if not title:
+                                    # Пробуем напрямую из user
                                     title = (
-                                        self._get_field(n0, "name", default=None)
-                                        or self._get_field(n0, "first_name", "firstName", default=None)
-                                        or f"User {dialog.cid}"
+                                        self._get_field(user, "name", default=None)
+                                        or self._get_field(user, "first_name", "firstName", default=None)
+                                        or None
                                     )
+                                    if title:
+                                        title = title.strip()
+                                
+                                # Получаем photo_id
                                 photo_id = self._get_field(user, "photo_id", "photoId", default=None)
-                        except Exception:
+                                
+                                # Получаем base_url для формирования icon_url
+                                base_url = self._get_field(user, "base_url", "baseUrl", default=None)
+                                base_raw_url = self._get_field(user, "base_raw_url", "baseRawUrl", default=None)
+                                # Используем base_url или base_raw_url для icon_url
+                                icon_url = base_url or base_raw_url
+                                # Cache-buster for avatars as well
+                                if icon_url:
+                                    try:
+                                        sep = "&" if "?" in str(icon_url) else "?"
+                                        icon_url = f"{icon_url}{sep}uid={int(peer_id)}"
+                                    except Exception:
+                                        pass
+                        except Exception as e:
+                            _dprint(f"Warning: Failed to get user info for peer_id {peer_id}: {e}")
                             pass
+
+                    # Если имя не найдено, используем fallback
+                    if not title:
+                        title = f"User {peer_id}" if peer_id is not None else f"Dialog {dialog.id}"
                     
                     chat_dict = {
                         "id": dialog.id,
                         "title": title,
                         "type": "DIALOG",
                         "photo_id": photo_id,  # Для диалога берем photo_id из User
-                        "icon_url": None,  # Dialog не имеет icon_url
+                        "icon_url": icon_url,  # Используем base_url из User для отображения фото профиля
                         "unread_count": 0,  # Dialog не имеет unread_count
-                        "cid": dialog.cid,
+                        "cid": peer_id,
                     }
-                    all_chats.append(chat_dict)
+                    _upsert(chat_dict)
                 
                 # Добавляем чаты (группы)
                 chat_ids = [chat.id for chat in self.client.chats]
                 if chat_ids:
                     chats = await self.client.get_chats(chat_ids)
                     for chat in chats:
+                        icon_url = self._get_field(chat, "base_icon_url", "baseIconUrl", default=None)
+                        if icon_url:
+                            try:
+                                sep = "&" if "?" in str(icon_url) else "?"
+                                icon_url = f"{icon_url}{sep}chatId={int(chat.id)}"
+                            except Exception:
+                                pass
                         chat_dict = {
                             "id": chat.id,
                             "title": self._get_field(chat, "title", default="") or "",
                             "type": "CHAT",
                             "photo_id": None,  # Chat не имеет photo_id, использует base_icon_url
-                            "icon_url": self._get_field(chat, "base_icon_url", "baseIconUrl", default=None),
+                            "icon_url": icon_url,
                             "unread_count": 0,  # Chat не имеет unread_count
                         }
-                        all_chats.append(chat_dict)
+                        _upsert(chat_dict)
                 
                 # Добавляем каналы (Channel наследуется от Chat)
                 for channel in self.client.channels:
+                    icon_url = self._get_field(channel, "base_icon_url", "baseIconUrl", default=None)
+                    if icon_url:
+                        try:
+                            sep = "&" if "?" in str(icon_url) else "?"
+                            icon_url = f"{icon_url}{sep}chatId={int(channel.id)}"
+                        except Exception:
+                            pass
                     chat_dict = {
                         "id": channel.id,
                         "title": self._get_field(channel, "title", default="") or "",
                         "type": "CHANNEL",
                         "photo_id": None,  # Channel не имеет photo_id, использует base_icon_url
-                        "icon_url": self._get_field(channel, "base_icon_url", "baseIconUrl", default=None),
+                        "icon_url": icon_url,
                         "unread_count": 0,  # Channel не имеет unread_count
                     }
-                    all_chats.append(chat_dict)
+                    _upsert(chat_dict)
                 
-                return {"success": True, "chats": all_chats}
+                return {"success": True, "chats": list(by_id.values())}
             
             return self._run_async(_get_chats())
         except Exception as e:
@@ -1478,19 +1745,46 @@ class MaxClientWrapper:
             return {"success": False, "error": "link required"}
         try:
             async def _join():
-                await self._ensure_connected_and_session()
-                ch = await self.client.join_channel(link)
-                if ch is None:
-                    return {"success": False, "error": "Channel not found"}
-                return {
-                    "success": True,
-                    "chat": {
-                        "id": self._get_field(ch, "id", default=None),
-                        "title": self._get_field(ch, "title", default="") or "",
-                        "type": "CHANNEL",
-                        "icon_url": self._get_field(ch, "base_icon_url", "baseIconUrl", default=None),
-                    },
-                }
+                # Join is sensitive to session state; do a couple of best-effort retries after reconnect.
+                last_err: Optional[Exception] = None
+                for attempt in range(3):
+                    try:
+                        await self._ensure_connected_and_session()
+                        ch = await self.client.join_channel(link)
+                        if ch is None:
+                            return {"success": False, "error": "Channel not found"}
+                        return {
+                            "success": True,
+                            "chat": {
+                                "id": self._get_field(ch, "id", default=None),
+                                "title": self._get_field(ch, "title", default="") or "",
+                                "type": "CHANNEL",
+                                "icon_url": self._get_field(ch, "base_icon_url", "baseIconUrl", default=None),
+                            },
+                        }
+                    except Exception as e:
+                        last_err = e
+                        # Connection/session-like errors: cleanup+retry
+                        s = str(e).lower()
+                        et = type(e).__name__.lower()
+                        is_conn = (
+                            "not connected" in s
+                            or "connection" in s
+                            or "send and wait failed" in s
+                            or "session" in s and "online" in s
+                            or et in ["socketnotconnectederror", "socketsenderror", "sslerror", "ssleoferror"]
+                        )
+                        if attempt < 2 and is_conn:
+                            try:
+                                if hasattr(self.client, "_cleanup_client"):
+                                    await self.client._cleanup_client()
+                            except Exception:
+                                pass
+                            await asyncio.sleep(0.6 * (attempt + 1))
+                            continue
+                        break
+
+                return {"success": False, "error": str(last_err) if last_err else "Join failed"}
 
             return self._run_async(_join())
         except Exception as e:
@@ -1554,15 +1848,15 @@ class MaxClientWrapper:
         
         try:
             async def _start():
-                # Подключаемся к Socket
-                await self.client.connect(self.client.user_agent)
-                
+                # Ensure connected/session (sync/post-login) and start keepalive for realtime events.
+                await self._ensure_connected_and_session()
+                try:
+                    await self._ensure_keepalive_started()
+                except Exception:
+                    pass
+                    
                 # Если есть сохраненный токен, используем его для синхронизации
                 if self.client._token:
-                    # Синхронизируем состояние с сервером
-                    await self.client._sync(self.client.user_agent)
-                    await self.client._post_login_tasks(sync=False)
-                    
                     # Получаем информацию о пользователе
                     me_info = None
                     if self.client.me:
@@ -1612,10 +1906,26 @@ class MaxClientWrapper:
         
         try:
             async def _stop():
+                # Stop keepalive loop first
+                if self._keepalive_stop is not None:
+                    try:
+                        self._keepalive_stop.set()
+                    except Exception:
+                        pass
+                if self._keepalive_task is not None:
+                    self._keepalive_task.cancel()
+                    try:
+                        await self._keepalive_task
+                    except Exception:
+                        pass
+                    self._keepalive_task = None
                 await self.client.close()
                 return {"success": True, "message": "Client stopped"}
             
-            return self._run_async(_stop())
+            result = self._run_async(_stop())
+            # Also stop asyncio loop thread to avoid dangling tasks on shutdown.
+            self._stop_loop_thread()
+            return result
         except Exception as e:
             return {"success": False, "error": str(e)}
 
@@ -1628,13 +1938,25 @@ def create_wrapper(phone: str, work_dir: Optional[str] = None, token: Optional[s
     """Создать глобальный экземпляр обертки."""
     global _wrapper_instance
     if not PYMAX_AVAILABLE:
-        return json.dumps({"success": False, "error": "pymax not available - missing dependencies"})
+        return json.dumps(
+            {
+                "success": False,
+                "error": "pymax not available - missing dependencies",
+                "details": _PYMAX_IMPORT_ERROR,
+            }
+        )
     try:
         _wrapper_instance = MaxClientWrapper(phone, work_dir, token)
         return json.dumps({"success": True})
     except RuntimeError as e:
         if "pymax not available" in str(e):
-            return json.dumps({"success": False, "error": "pymax not available - missing dependencies"})
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": "pymax not available - missing dependencies",
+                    "details": _PYMAX_IMPORT_ERROR or str(e),
+                }
+            )
         return json.dumps({"success": False, "error": str(e)})
     except Exception as e:
         return json.dumps({"success": False, "error": str(e)})

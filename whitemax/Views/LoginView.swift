@@ -27,14 +27,10 @@ struct LoginView: View {
 
             VStack(spacing: 18) {
                 VStack(spacing: 8) {
-                    Text("Вход в Max")
+                    Text("Вход в WhiteMax")
                         .font(.largeTitle.bold())
                     Text("Введите номер телефона, чтобы получить код авторизации")
                         .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center)
-                    Text("Приватность: приложение не запрашивает доступ к вашей галерее/камере. Вы выбираете файлы через системные пикеры.")
-                        .font(.caption)
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
                 }

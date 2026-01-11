@@ -549,10 +549,10 @@ if [ -d "${PYTHON_LIB_DEST}" ]; then
         # ВАЖНО: lz4 требует C расширений, которые нужно компилировать для iOS отдельно
         # На iOS бинарники из macOS не будут работать
         if [ "${INSTALL_LZ4_VIA_PIP}" = "true" ]; then
-            PYMAX_DEPS="sqlmodel>=0.0.24 websockets>=15.0 msgpack>=1.1.1 aiohttp>=3.12.15 aiofiles>=24.1.0 qrcode>=8.2 ua-generator>=2.0.19 lz4>=4.4.4"
+            PYMAX_DEPS="requests sqlmodel>=0.0.24 websockets>=15.0 msgpack>=1.1.1 aiohttp>=3.12.15 aiofiles>=24.1.0 qrcode>=8.2 ua-generator>=2.0.19 lz4>=4.4.4"
         else
             # Исключаем lz4 из установки через pip на iOS, так как используем pre-built wheel
-            PYMAX_DEPS="sqlmodel>=0.0.24 websockets>=15.0 msgpack>=1.1.1 aiohttp>=3.12.15 aiofiles>=24.1.0 qrcode>=8.2 ua-generator>=2.0.19"
+            PYMAX_DEPS="requests sqlmodel>=0.0.24 websockets>=15.0 msgpack>=1.1.1 aiohttp>=3.12.15 aiofiles>=24.1.0 qrcode>=8.2 ua-generator>=2.0.19"
             echo "Skipping lz4 in pip install (using pre-built iOS wheel)"
         fi
         

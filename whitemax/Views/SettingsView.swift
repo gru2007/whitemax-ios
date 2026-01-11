@@ -6,28 +6,12 @@
 import SwiftUI
 
 struct SettingsView: View {
-    @AppStorage("private_mode") private var privateMode: Bool = false
     @StateObject private var service = MaxClientService.shared
 
     @State private var isClearing: Bool = false
 
     var body: some View {
         Form {
-            Section("Приватность") {
-                Toggle("Private Mode (не писать события на диск)", isOn: $privateMode)
-                    .onChange(of: privateMode) { _, newValue in
-                        if newValue {
-                            service.stopEventMonitoring()
-                        } else {
-                            Task { try? await service.startEventMonitoring() }
-                        }
-                    }
-
-                Text("В Private Mode real-time обновления могут быть ограничены, но приложение оставляет меньше локальных следов.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-
             Section("Организация") {
                 NavigationLink("Папки") {
                     FoldersView()

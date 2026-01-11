@@ -8,7 +8,6 @@ import SwiftUI
 struct MessageSearchView: View {
     @StateObject private var service = MaxClientService.shared
     @StateObject private var index = MaxClientService.shared.messageIndex
-    @AppStorage("private_mode") private var privateMode: Bool = false
 
     @State private var query: String = ""
     @State private var results: [MessageSearchHit] = []
@@ -43,11 +42,6 @@ struct MessageSearchView: View {
                         .foregroundStyle(.red)
                 }
 
-                if privateMode {
-                    Text("Private Mode не отключает локальный поиск, но уменьшает фоновые действия. Индекс строится только по явному нажатию.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
             }
 
             Section("Результаты") {

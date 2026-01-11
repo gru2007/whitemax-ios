@@ -13,6 +13,9 @@ struct MessageBubbleView: View {
     let onReact: () -> Void
     let onDelete: () -> Void
     let onPin: () -> Void
+    let onOpenAttachment: (MaxAttachment) -> Void
+    var onSaveAttachment: ((MaxAttachment) -> Void)? = nil
+    var onShareAttachment: ((MaxAttachment) -> Void)? = nil
 
     var body: some View {
         HStack {
@@ -32,7 +35,7 @@ struct MessageBubbleView: View {
                     }
 
                     if let attachments = message.attachments, !attachments.isEmpty {
-                        AttachmentListView(attachments: attachments, isOutgoing: isOutgoing)
+                        AttachmentListView(attachments: attachments, isOutgoing: isOutgoing, onOpen: onOpenAttachment)
                     }
 
                     if !message.text.isEmpty {
@@ -90,6 +93,28 @@ struct MessageBubbleView: View {
                 } label: {
                     Label("Скопировать", systemImage: "doc.on.doc")
                 }
+                
+                if let attachments = message.attachments, !attachments.isEmpty {
+                    Divider()
+                    
+                    ForEach(attachments) { attachment in
+                        if let onSave = onSaveAttachment {
+                            Button {
+                                onSave(attachment)
+                            } label: {
+                                Label("Сохранить \(attachment.fileName ?? "вложение")", systemImage: "square.and.arrow.down")
+                            }
+                        }
+                        
+                        if let onShare = onShareAttachment {
+                            Button {
+                                onShare(attachment)
+                            } label: {
+                                Label("Отправить \(attachment.fileName ?? "вложение")", systemImage: "square.and.arrow.up")
+                            }
+                        }
+                    }
+                }
 
                 Button {
                     onPin()
@@ -111,35 +136,41 @@ struct MessageBubbleView: View {
     private struct AttachmentListView: View {
         let attachments: [MaxAttachment]
         let isOutgoing: Bool
+        let onOpen: (MaxAttachment) -> Void
 
         var body: some View {
             VStack(alignment: .leading, spacing: 6) {
                 ForEach(attachments) { a in
-                    HStack(spacing: 8) {
-                        Image(systemName: icon(for: a))
-                            .symbolRenderingMode(.hierarchical)
-                            .foregroundStyle(isOutgoing ? .white.opacity(0.9) : .secondary)
+                    Button {
+                        onOpen(a)
+                    } label: {
+                        HStack(spacing: 8) {
+                            Image(systemName: icon(for: a))
+                                .symbolRenderingMode(.hierarchical)
+                                .foregroundStyle(isOutgoing ? .white.opacity(0.9) : .secondary)
 
-                        Text(title(for: a))
-                            .font(.subheadline.weight(.semibold))
-                            .foregroundStyle(isOutgoing ? .white : .primary)
-                            .lineLimit(1)
+                            Text(title(for: a))
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(isOutgoing ? .white : .primary)
+                                .lineLimit(1)
 
-                        Spacer(minLength: 0)
+                            Spacer(minLength: 0)
 
-                        if let fileSize = a.fileSize, fileSize > 0 {
-                            Text(Self.formatBytes(fileSize))
-                                .font(.caption2)
-                                .foregroundStyle(isOutgoing ? .white.opacity(0.85) : .secondary)
+                            if let fileSize = a.fileSize, fileSize > 0 {
+                                Text(Self.formatBytes(fileSize))
+                                    .font(.caption2)
+                                    .foregroundStyle(isOutgoing ? .white.opacity(0.85) : .secondary)
+                            }
+                        }
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 8)
+                        .background(.thinMaterial.opacity(isOutgoing ? 0.25 : 0.8), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                .strokeBorder(.white.opacity(isOutgoing ? 0.10 : 0.08), lineWidth: 1)
                         }
                     }
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 8)
-                    .background(.thinMaterial.opacity(isOutgoing ? 0.25 : 0.8), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 14, style: .continuous)
-                            .strokeBorder(.white.opacity(isOutgoing ? 0.10 : 0.08), lineWidth: 1)
-                    }
+                    .buttonStyle(.plain)
                 }
             }
         }

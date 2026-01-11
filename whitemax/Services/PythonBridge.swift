@@ -13,26 +13,78 @@ class PythonBridge {
     static let shared = PythonBridge()
     
     private var isInitialized = false
+    private var pythonThread: Thread?
+    private let threadLock = NSLock()
+    private let threadReady = DispatchSemaphore(value: 0)
+
+    // Swift 6: nested types cannot be declared inside generic functions.
+    private final class PythonCallBox: NSObject {
+        let body: () throws -> Any
+        var result: Result<Any, Error>?
+        init(body: @escaping () throws -> Any) { self.body = body }
+        @objc func invoke() { result = Result { try body() } }
+    }
     
     private init() {}
 
     /// PythonKit / embedded CPython are not thread-safe. We must run all Python operations
-    /// on the same thread where Python was initialized. For now we standardize on main thread.
-    func withPython<T>(_ body: () throws -> T) throws -> T {
-        if Thread.isMainThread {
+    /// on the same OS thread where Python was initialized.
+    /// IMPORTANT: DispatchQueue (even serial) does NOT guarantee a stable OS thread.
+    func withPython<T>(_ body: @escaping () throws -> T) throws -> T {
+        let thread = ensurePythonThread()
+
+        // If already on Python thread, execute directly.
+        if Thread.current === thread {
             return try body()
         }
 
-        var result: Result<T, Error>!
-        DispatchQueue.main.sync {
-            result = Result { try body() }
+        let box = PythonCallBox(body: { try body() })
+        box.perform(#selector(PythonCallBox.invoke), on: thread, with: nil, waitUntilDone: true)
+
+        guard let res = box.result else {
+            throw PythonBridgeError.initializationFailed("Python execution failed")
         }
-        return try result.get()
+        return try (res.get() as! T)
+    }
+
+    func withPythonAsync<T>(_ body: @escaping () throws -> T) async throws -> T {
+        // Never block the caller (often MainActor). Execution still happens on pythonThread.
+        return try await Task.detached(priority: .userInitiated) {
+            try PythonBridge.shared.withPython(body)
+        }.value
+    }
+
+    private func ensurePythonThread() -> Thread {
+        threadLock.lock()
+        if let t = pythonThread {
+            threadLock.unlock()
+            return t
+        }
+
+        let t = Thread { [weak self] in
+            Thread.current.name = "whitemax.python.thread"
+            // Keep runloop alive so perform(_:on:) works.
+            let port = Port()
+            RunLoop.current.add(port, forMode: .default)
+            // Start the runloop once so we can safely accept perform(on:).
+            _ = RunLoop.current.run(mode: .default, before: Date())
+            self?.threadReady.signal()
+            while !Thread.current.isCancelled {
+                RunLoop.current.run(mode: .default, before: .distantFuture)
+            }
+        }
+        t.qualityOfService = .userInitiated
+        pythonThread = t
+        t.start()
+        threadLock.unlock()
+
+        _ = threadReady.wait(timeout: .now() + 2.0)
+        return t
     }
     
     func initialize() throws {
         try withPython {
-            guard !isInitialized else { return }
+            guard !self.isInitialized else { return }
         
             // Получаем путь к app bundle
             guard let bundlePath = Bundle.main.resourcePath else {
@@ -73,6 +125,20 @@ class PythonBridge {
                 let _ = try Python.attemptImport("encodings")
                 print("✓ encodings module loaded successfully")
 
+                // Dependency smoke-checks (helps debug "pydantic-core required" on device)
+                do {
+                    let pydanticCore = try Python.attemptImport("pydantic_core")
+                    print("✓ pydantic_core imported: \(pydanticCore)")
+                } catch {
+                    print("✗ Failed to import pydantic_core: \(error)")
+                }
+                do {
+                    let pydantic = try Python.attemptImport("pydantic")
+                    print("✓ pydantic imported: \(pydantic)")
+                } catch {
+                    print("✗ Failed to import pydantic: \(error)")
+                }
+
                 // Добавляем app путь в sys.path если его там нет
                 let sysPath: PythonObject = sys.path
                 let appPathObj = PythonObject(appPath)
@@ -104,7 +170,7 @@ class PythonBridge {
                     print("✗ app directory NOT found: \(appPath)")
                 }
 
-                isInitialized = true
+                self.isInitialized = true
             } catch {
                 print("Python initialization error: \(error)")
                 // Выводим дополнительную диагностику
@@ -125,7 +191,7 @@ class PythonBridge {
     
     func importModule(_ name: String) throws -> PythonObject {
         return try withPython {
-            guard isInitialized else {
+            guard self.isInitialized else {
                 throw PythonBridgeError.notInitialized
             }
 

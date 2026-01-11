@@ -98,6 +98,16 @@ struct ChatsListView: View {
         }
         .task {
             await loadChatsAsync()
+            // Enable real-time chat updates (best-effort)
+            try? await service.startEventMonitoring()
+        }
+        .onChange(of: service.chatUpdates.count) { _ in
+            guard let last = service.chatUpdates.last else { return }
+            if let idx = chats.firstIndex(where: { $0.id == last.id }) {
+                chats[idx] = last
+            } else {
+                chats.insert(last, at: 0)
+            }
         }
     }
 
