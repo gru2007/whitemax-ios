@@ -1,0 +1,3 @@
+[submodule "pymax"]
+	path = pymax
+	url = https://github.com/gru2007/PyMax-iOS
