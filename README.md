@@ -1,3 +1,8 @@
+> [!WARNING]
+> Этот проект proof-of-concept интеграции Python библиотеки в iOS SwiftUI приложение. Для стабильного клиента используйте другие решения, например: https://github.com/KometTeam/Komet
+
+---
+
 <h1 align="center">WhiteMax</h1>
 
 <p align="center">
